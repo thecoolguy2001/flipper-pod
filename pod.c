@@ -117,7 +117,6 @@ typedef struct {
     int8_t result;
     uint16_t xp_gained;
     uint16_t anim; // result-screen animation frame
-    bool debug_opp; // DEBUG: opponent taps generated locally (no real peer)
     char reason[24];
 } PodBattleModel;
 
@@ -154,9 +153,6 @@ typedef struct {
     uint16_t selected_encounter;
     bool in_battle;
     uint32_t battle_return_view;
-    FuriTimer* debug_timer; // DEBUG: fake-encounter test hook
-    bool debug_arm; // next challenge is a local-opponent debug battle
-    bool debug_fired; // fired once this launch
 } Pod;
 
 static void pod_profile_widget_populate(Pod* app);
@@ -273,17 +269,12 @@ static void pod_handle_challenge(Pod* app, const PodMsg* msg) {
     app->in_battle = true;
     app->battle_return_view = PodViewWalkMode;
     uint8_t my_level = pod_profile_dolphin_level();
-    bool debug = app->debug_arm;
-    app->debug_arm = false;
-    uint32_t dbg_target = 45 + (uint32_t)msg->level * 2 + (furi_hal_random_get() % 15);
     with_view_model(
         app->battle_view,
         PodBattleModel * m,
         {
             m->phase = BPhaseChallenged;
             m->practice = false;
-            m->debug_opp = debug;
-            m->opp_target = dbg_target;
             m->elapsed_ms = 0;
             m->timeout_ms = 0;
             m->resend_ms = 0;
@@ -401,7 +392,6 @@ static void pod_start_practice(Pod* app) {
         {
             m->phase = BPhaseCountdown;
             m->practice = true;
-            m->debug_opp = false;
             m->elapsed_ms = 0;
             m->my_taps = 0;
             m->opp_taps = 0;
@@ -530,11 +520,6 @@ static void pod_walk_enter(void* context) {
         furi_timer_start(app->beacon_timer, furi_ms_to_ticks(POD_BEACON_PERIOD_MS));
         furi_timer_start(app->anim_timer, furi_ms_to_ticks(POD_ANIM_PERIOD_MS));
     }
-    // DEBUG: fire the fake-encounter test hook once per launch.
-    if(!app->debug_fired) {
-        app->debug_fired = true;
-        furi_timer_start(app->debug_timer, furi_ms_to_ticks(3000));
-    }
 }
 
 static void pod_walk_exit(void* context) {
@@ -570,35 +555,6 @@ static void pod_anim_timer_cb(void* context) {
         true);
 }
 
-// DEBUG/TEST HOOK — remove before release.
-// 3s after the first Walk Mode entry, fake a peer appearing and challenging you,
-// so the whole encounter->challenge->accept->battle->result flow can be tested
-// with a single Flipper. The battle resolves with a locally-generated opponent.
-#define POD_DEBUG_PEER_ID 0x00C0FFEEu
-static void pod_debug_timer_cb(void* context) {
-    Pod* app = context;
-    PodMsg b;
-    memset(&b, 0, sizeof(b));
-    b.type = PodMsgBeacon;
-    b.src_id = POD_DEBUG_PEER_ID;
-    strncpy(b.name, "KAIJU-DAVE", sizeof(b.name) - 1);
-    b.level = 12;
-    b.nonce = (uint16_t)(furi_hal_random_get() & 0xFFFF);
-    furi_message_queue_put(app->msg_queue, &b, 0);
-
-    PodMsg c;
-    memset(&c, 0, sizeof(c));
-    c.type = PodMsgChallenge;
-    c.src_id = POD_DEBUG_PEER_ID;
-    c.dst_id = app->profile.profile_id;
-    strncpy(c.name, "KAIJU-DAVE", sizeof(c.name) - 1);
-    c.level = 12;
-    c.battle_id = (uint16_t)(furi_hal_random_get() & 0xFFFF);
-    app->debug_arm = true;
-    furi_message_queue_put(app->msg_queue, &c, 0);
-    view_dispatcher_send_custom_event(app->view_dispatcher, PodEventMsg);
-}
-
 // --- In-range list ---
 
 static void pod_inrange_menu_cb(void* context, uint32_t index) {
@@ -623,7 +579,6 @@ static void pod_inrange_menu_cb(void* context, uint32_t index) {
         {
             m->phase = BPhaseChallenging;
             m->practice = false;
-            m->debug_opp = false;
             m->elapsed_ms = 0;
             m->timeout_ms = 0;
             m->resend_ms = 0;
@@ -686,7 +641,7 @@ static void pod_battle_draw(Canvas* canvas, void* model) {
     }
     case BPhaseActive: {
         int secs = (int)((POD_ACTIVE_MS - m->elapsed_ms + 999) / 1000);
-        bool show_opp = m->practice || m->debug_opp;
+        bool show_opp = m->practice;
         bool you_lead = show_opp ? (m->my_taps >= m->opp_taps) : true;
         // highlight the leader's panel
         if(you_lead)
@@ -847,12 +802,12 @@ static void pod_battle_timer_cb(void* context) {
                 break;
             case BPhaseActive:
                 m->elapsed_ms += POD_TICK_MS;
-                if(m->practice || m->debug_opp) {
+                if(m->practice) {
                     uint32_t e = m->elapsed_ms > POD_ACTIVE_MS ? POD_ACTIVE_MS : m->elapsed_ms;
                     m->opp_taps = m->opp_target * e / POD_ACTIVE_MS;
                 }
                 if(m->elapsed_ms >= POD_ACTIVE_MS) {
-                    if(m->practice || m->debug_opp) {
+                    if(m->practice) {
                         m->opp_taps = m->opp_target;
                         m->result = (m->my_taps > m->opp_taps) ? 1 :
                                     (m->my_taps < m->opp_taps) ? -1 :
@@ -1171,9 +1126,6 @@ static Pod* pod_alloc(void) {
     app->beacon_timer = furi_timer_alloc(pod_beacon_timer_cb, FuriTimerTypePeriodic, app);
     app->anim_timer = furi_timer_alloc(pod_anim_timer_cb, FuriTimerTypePeriodic, app);
     app->battle_timer = furi_timer_alloc(pod_battle_timer_cb, FuriTimerTypePeriodic, app);
-    app->debug_timer = furi_timer_alloc(pod_debug_timer_cb, FuriTimerTypeOnce, app);
-    app->debug_arm = false;
-    app->debug_fired = false;
 
     app->gui = furi_record_open(RECORD_GUI);
     app->notifications = furi_record_open(RECORD_NOTIFICATION);
@@ -1257,12 +1209,10 @@ static void pod_free(Pod* app) {
     furi_timer_stop(app->beacon_timer);
     furi_timer_stop(app->anim_timer);
     furi_timer_stop(app->battle_timer);
-    furi_timer_stop(app->debug_timer);
     if(pod_radio_is_running(app->radio)) pod_radio_stop(app->radio);
     furi_timer_free(app->beacon_timer);
     furi_timer_free(app->anim_timer);
     furi_timer_free(app->battle_timer);
-    furi_timer_free(app->debug_timer);
     furi_message_queue_free(app->msg_queue);
     pod_radio_free(app->radio);
     free(app);
